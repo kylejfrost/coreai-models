@@ -65,6 +65,15 @@ _EXTERNALIZE_SPECS = [
 ]
 
 
+def _should_optimize() -> bool:
+    return os.environ.get("COREAI_MACOS_OPTIMIZE", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 def _build_reference_inputs(
     model: torch.nn.Module,
     config,
@@ -354,8 +363,11 @@ def export_macos_model(
             state_names=state_names,
         )
 
-    logger.info("Optimizing AIProgram...")
-    coreai_program.optimize()
+    if _should_optimize():
+        logger.info("Optimizing AIProgram...")
+        coreai_program.optimize()
+    else:
+        logger.info("Skipping AIProgram optimization (COREAI_MACOS_OPTIMIZE=0)")
 
     return coreai_program
 
@@ -399,6 +411,12 @@ def export_macos_model_entrypoint(
         entrypoint_name=entrypoint_name,
     )
 
-    logger.info("Optimizing %s AIProgram...", entrypoint_name)
-    coreai_program.optimize()
+    if _should_optimize():
+        logger.info("Optimizing %s AIProgram...", entrypoint_name)
+        coreai_program.optimize()
+    else:
+        logger.info(
+            "Skipping %s AIProgram optimization (COREAI_MACOS_OPTIMIZE=0)",
+            entrypoint_name,
+        )
     return coreai_program
