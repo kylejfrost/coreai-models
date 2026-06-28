@@ -12,9 +12,11 @@ MLIR quantization, and compilation into a single ``export_model`` call.
 
 import asyncio
 import contextlib
+import gc
 import logging
 import os
 import re
+import shutil
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,7 +38,7 @@ from coreai_models.export.compression import (
     quantize_pytorch_model,
 )
 from coreai_models.export.ios import export_ios_model
-from coreai_models.export.macos import export_macos_model
+from coreai_models.export.macos import export_macos_model, export_macos_model_entrypoint
 from coreai_models.export.metadata import build_aimodel_metadata
 from coreai_models.export.presets import (
     DEFAULT_MACOS_COMPRESSION_PRESET,
@@ -302,14 +304,6 @@ async def _async_export_model(config: ExportConfig) -> str:
             )
             model = palettize_pytorch_model(model, palettization_inputs, torch_palettization_config)
 
-        # ---- 4. Variant-specific export ----
-        if config.variant == "macOS":
-            coreai_program = export_macos_model(model, hf_config, config)
-        else:
-            coreai_program = await export_ios_model(model, hf_config, config)
-
-        del model
-
         # ---- 5. Save inside bundle directory ----
         output_dir = Path(config.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -319,15 +313,63 @@ async def _async_export_model(config: ExportConfig) -> str:
         bundle_path.mkdir(parents=True, exist_ok=True)
         aimodel_path = bundle_path / f"{output_name}.aimodel"
 
+        separate_decode_asset = (
+            config.variant == "macOS"
+            and os.environ.get("COREAI_MACOS_DECODE_ASSET", "").lower() in ("1", "true", "yes")
+        )
+        decode_asset_name = f"{output_name}-decode.aimodel"
+        decode_aimodel_path = bundle_path / decode_asset_name
+
         if aimodel_path.exists():
             if config.overwrite:
-                import shutil
-
                 shutil.rmtree(aimodel_path)
             else:
                 raise FileExistsError(
                     f"{aimodel_path} already exists. Use --overwrite to replace it."
                 )
+        if separate_decode_asset and decode_aimodel_path.exists():
+            if config.overwrite:
+                shutil.rmtree(decode_aimodel_path)
+            else:
+                raise FileExistsError(
+                    f"{decode_aimodel_path} already exists. Use --overwrite to replace it."
+                )
+
+        # ---- 4. Variant-specific export ----
+        if separate_decode_asset:
+            metadata = build_aimodel_metadata(config.hf_model_id)
+
+            logger.info(f"Saving main model to {aimodel_path}...")
+            main_program = export_macos_model_entrypoint(model, hf_config, config, "main")
+            await asyncio.to_thread(main_program.save_asset, aimodel_path, metadata)
+            del main_program
+            gc.collect()
+
+            logger.info(f"Saving decode model to {decode_aimodel_path}...")
+            decode_program = export_macos_model_entrypoint(model, hf_config, config, "decode")
+            await asyncio.to_thread(decode_program.save_asset, decode_aimodel_path, metadata)
+            del decode_program
+            gc.collect()
+            del model
+
+            bundle_llm_asset(
+                bundle_path=bundle_path,
+                hf_model_id=config.hf_model_id,
+                hf_config=hf_config,
+                compression=config.compression,
+                name=output_name,
+                decode_asset_name=decode_asset_name,
+            )
+
+            logger.info(f"Export complete: {bundle_path}")
+            return str(bundle_path)
+
+        if config.variant == "macOS":
+            coreai_program = export_macos_model(model, hf_config, config)
+        else:
+            coreai_program = await export_ios_model(model, hf_config, config)
+
+        del model
 
         logger.info(f"Saving model to {aimodel_path}...")
         # ``AIProgram.save_asset`` is synchronous and does blocking disk I/O,

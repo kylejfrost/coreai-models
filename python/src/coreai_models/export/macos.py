@@ -12,6 +12,7 @@ torch.export -> decompose -> defunctionalize -> TorchConverter -> optimize.
 
 import logging
 import os
+from typing import Literal
 
 import coreai_torch
 import coreai_torch.composite_ops
@@ -356,4 +357,48 @@ def export_macos_model(
     logger.info("Optimizing AIProgram...")
     coreai_program.optimize()
 
+    return coreai_program
+
+
+def export_macos_model_entrypoint(
+    model: torch.nn.Module,
+    config,
+    export_config,
+    entrypoint_name: Literal["main", "decode"],
+) -> AIProgram:
+    """Export a single macOS entrypoint as its own AIProgram."""
+    max_context_length = getattr(export_config, "max_context_length", None)
+    if max_context_length is None:
+        max_context_length = getattr(config, "max_position_embeddings", 2048)
+
+    target_dtype = next(model.parameters()).dtype
+    logger.info(
+        "Exporting macOS %s entrypoint (dtype=%s, max_context_length=%s)",
+        entrypoint_name,
+        target_dtype,
+        max_context_length,
+    )
+
+    if entrypoint_name == "decode":
+        reference_inputs, dynamic_shapes = _build_decode_reference_inputs(
+            model, config, target_dtype, max_context_length
+        )
+    else:
+        reference_inputs, dynamic_shapes = _build_reference_inputs(
+            model, config, target_dtype, max_context_length
+        )
+
+    logger.info("Exporting %s entrypoint to Core AI dialect...", entrypoint_name)
+    coreai_program = export_to_coreai(
+        model,
+        reference_inputs,
+        dynamic_shapes=dynamic_shapes,
+        input_names=("input_ids", "position_ids"),
+        output_names=("logits",),
+        state_names=(KEY_CACHE_NAME, VALUE_CACHE_NAME),
+        entrypoint_name=entrypoint_name,
+    )
+
+    logger.info("Optimizing %s AIProgram...", entrypoint_name)
+    coreai_program.optimize()
     return coreai_program

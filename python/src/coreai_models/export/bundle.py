@@ -25,13 +25,14 @@ def bundle_llm_asset(
     hf_config: Any,
     compression: str,
     name: str,
+    decode_asset_name: str | None = None,
 ) -> None:
     """Add tokenizer and metadata.json (0.2 schema) to an LLM bundle.
 
     Expects ``{name}.aimodel`` to already exist inside bundle_path.
     """
     _write_tokenizer(bundle_path / "tokenizer", hf_model_id)
-    _write_metadata(bundle_path, hf_model_id, hf_config, compression, name)
+    _write_metadata(bundle_path, hf_model_id, hf_config, compression, name, decode_asset_name)
 
 
 def _write_tokenizer(dest: Path, hf_model_id: str) -> None:
@@ -46,15 +47,21 @@ def _write_metadata(
     hf_config: Any,
     compression: str,
     name: str,
+    decode_asset_name: str | None = None,
 ) -> None:
+    assets = {"main": f"{name}.aimodel"}
+    if decode_asset_name is not None:
+        assets["decode"] = decode_asset_name
     function_map = {"main": ["main"]}
-    if os.environ.get("COREAI_MACOS_DECODE_ENTRYPOINT", "").lower() in ("1", "true", "yes"):
+    if decode_asset_name is not None or os.environ.get(
+        "COREAI_MACOS_DECODE_ENTRYPOINT", ""
+    ).lower() in ("1", "true", "yes"):
         function_map["decode"] = ["decode"]
     metadata: dict[str, Any] = {
         "metadata_version": METADATA_VERSION,
         "kind": "llm",
         "name": name,
-        "assets": {"main": f"{name}.aimodel"},
+        "assets": assets,
         "language": {
             "tokenizer": hf_model_id,
             "vocab_size": getattr(hf_config, "vocab_size", None),
