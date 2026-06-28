@@ -173,7 +173,7 @@ def _build_safetensors_key_index(
     Returns ``(per_layer_index, shared_index)`` keyed by *original* safetensors
     keys (prefix not stripped); callers must strip before assigning.
     """
-    layer_pattern = re.compile(r"model\.layers\.(\d+)\.")
+    layer_pattern = re.compile(r"(?:model\.language_model\.|model\.)layers\.(\d+)\.")
     per_layer: dict[int, dict[str, str]] = {}
     shared: dict[str, str] = {}
     for path in safetensors_files:
@@ -300,6 +300,20 @@ class BaseForCausalLM(torch.nn.Module):
         """
         ...
 
+    def _postprocess_loaded_state_dict(
+        self: Self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        target_dtype: torch.dtype,
+    ) -> None:
+        """Optionally mutate a loaded state dict with access to the model instance.
+
+        Most model families can express all remapping in ``_mutate_state_dict``.
+        Some authored compression paths need the instantiated module so they can
+        install parametrizations and remove the corresponding raw weights before
+        the remaining tensors are loaded or memory-mapped.
+        """
+
     @classmethod
     def _get_reauthored_config(
         cls,
@@ -388,6 +402,7 @@ class BaseForCausalLM(torch.nn.Module):
             }
 
         model._mutate_state_dict(state_dict)
+        model._postprocess_loaded_state_dict(state_dict, target_dtype=target_dtype)
 
         # check the state_dict is in the correct dtype
         for k, v in state_dict.items():
@@ -440,9 +455,14 @@ class BaseForCausalLM(torch.nn.Module):
                 Use for multimodal checkpoints where text weights live under
                 a prefix (e.g. ``"language_model."``).
         """
-        model_dir = snapshot_download(
-            huggingface_model_id,
-            allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
+        import os as _os
+        model_dir = (
+            huggingface_model_id
+            if _os.path.isdir(huggingface_model_id)
+            else snapshot_download(
+                huggingface_model_id,
+                allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
+            )
         )
 
         raw_config = AutoConfig.from_pretrained(model_dir)
@@ -464,6 +484,7 @@ class BaseForCausalLM(torch.nn.Module):
         shared_dict = _load_tensors_for_keys(shared_index, target_dtype)
         shared_dict = {k.removeprefix(hf_state_dict_prefix): v for k, v in shared_dict.items()}
         del shared_index
+        model._postprocess_loaded_state_dict(shared_dict, target_dtype=target_dtype)
 
         if mmap_path is not None:
             os.makedirs(mmap_path, exist_ok=True)
@@ -487,6 +508,7 @@ class BaseForCausalLM(torch.nn.Module):
             # Subclass `_mutate_state_dict` is layer-keyed and safe on a
             # single-layer slice.
             model._mutate_state_dict(layer_sd)
+            model._postprocess_loaded_state_dict(layer_sd, target_dtype=target_dtype)
 
             if mmap_path is not None:
                 layer_prefix = f"model.layers.{layer_idx}."
@@ -543,6 +565,7 @@ class BaseForCausalLM(torch.nn.Module):
 
         state_dict = torch.load(model_path, map_location="cpu")
         model._mutate_state_dict(state_dict)
+        model._postprocess_loaded_state_dict(state_dict, target_dtype=target_dtype)
         model.load_state_dict(state_dict, assign=True)
 
         if mmap_path is not None:

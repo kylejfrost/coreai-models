@@ -11,6 +11,8 @@ torch.export -> decompose -> defunctionalize -> TorchConverter -> optimize.
 """
 
 import logging
+import os
+from typing import Literal
 
 import coreai_torch
 import coreai_torch.composite_ops
@@ -61,6 +63,15 @@ _EXTERNALIZE_SPECS = [
         composite_attrs=[],
     ),
 ]
+
+
+def _should_optimize() -> bool:
+    return os.environ.get("COREAI_MACOS_OPTIMIZE", "1").lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
 
 
 def _build_reference_inputs(
@@ -124,6 +135,53 @@ def _build_reference_inputs(
     return reference_inputs, dynamic_shapes
 
 
+def _build_decode_reference_inputs(
+    model: torch.nn.Module,
+    config,
+    target_dtype: torch.dtype,
+    max_context_length: int,
+) -> tuple[dict[str, torch.Tensor], dict]:
+    """Build one-token decode reference inputs for a separate macOS entrypoint."""
+    batch_size = 1
+    vocab_size = config.vocab_size
+
+    input_ids = torch.randint(1, vocab_size, (batch_size, 1), dtype=torch.int32)
+    position_ids = (
+        torch.arange(QUANT_TRACE_OFFSET + 1, dtype=torch.int32)
+        .unsqueeze(0)
+        .expand(batch_size, QUANT_TRACE_OFFSET + 1)
+    )
+
+    saved_max_pos = config.max_position_embeddings
+    config.max_position_embeddings = TRACE_KV_CACHE_SEQ_LEN
+    k_cache, v_cache = KVCache.create_cache_tensors(config, dtype=target_dtype)
+    config.max_position_embeddings = saved_max_pos
+
+    reference_inputs = {
+        "input_ids": input_ids,
+        "position_ids": position_ids,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+    }
+    dynamic_shapes = {
+        "input_ids": None,
+        "position_ids": {
+            1: torch.export.Dim("decode_seq_pos", min=1, max=max_context_length - 1)
+        },
+        "k_cache": {
+            KVCache.seq_len_dim(): torch.export.Dim(
+                "decode_k_seq_len", min=TRACE_KV_CACHE_SEQ_LEN, max=max_context_length
+            )
+        },
+        "v_cache": {
+            KVCache.seq_len_dim(): torch.export.Dim(
+                "decode_v_seq_len", min=TRACE_KV_CACHE_SEQ_LEN, max=max_context_length
+            )
+        },
+    }
+    return reference_inputs, dynamic_shapes
+
+
 def export_to_coreai(
     model: torch.nn.Module,
     reference_inputs: dict[str, torch.Tensor],
@@ -131,6 +189,7 @@ def export_to_coreai(
     input_names: tuple[str, ...] | None = None,
     output_names: tuple[str, ...] | None = None,
     state_names: tuple[str, ...] | None = None,
+    entrypoint_name: str = "main",
 ) -> AIProgram:
     """Export a stateful macOS model to a AIProgram.
 
@@ -191,7 +250,51 @@ def export_to_coreai(
         input_names=input_names,
         output_names=output_names,
         state_names=state_names,
+        entrypoint_name=entrypoint_name,
     )
+    register_custom_torch_lowering(converter)
+    return converter.to_coreai()
+
+
+def export_to_coreai_entrypoints(
+    model: torch.nn.Module,
+    entrypoints: list[tuple[str, dict[str, torch.Tensor], dict | None]],
+    input_names: tuple[str, ...],
+    output_names: tuple[str, ...],
+    state_names: tuple[str, ...],
+) -> AIProgram:
+    """Export several macOS entrypoints into one AIProgram."""
+
+    def make_export_fn(reference_inputs: dict[str, torch.Tensor], dynamic_shapes: dict | None):
+        def export_fn(module: torch.nn.Module) -> torch.export.ExportedProgram:
+            with torch.no_grad():
+                aten_exported_program = torch.export.export(
+                    module,
+                    args=(),
+                    kwargs=reference_inputs,
+                    dynamic_shapes=dynamic_shapes,
+                )
+            coreai_decomp_table = coreai_torch.get_decomp_table()
+            coreaten_exported_program = aten_exported_program.run_decompositions(
+                coreai_decomp_table
+            )
+            remove_functionalization(coreaten_exported_program)
+            return coreaten_exported_program
+
+        return export_fn
+
+    model.eval()
+    converter = coreai_torch.TorchConverter()
+    for name, reference_inputs, dynamic_shapes in entrypoints:
+        converter.add_pytorch_module(
+            model,
+            export_fn=make_export_fn(reference_inputs, dynamic_shapes),
+            externalize_modules=_EXTERNALIZE_SPECS,
+            input_names=input_names,
+            output_names=output_names,
+            state_names=state_names,
+            entrypoint_name=name,
+        )
     register_custom_torch_lowering(converter)
     return converter.to_coreai()
 
@@ -236,16 +339,84 @@ def export_macos_model(
     state_names = (KEY_CACHE_NAME, VALUE_CACHE_NAME)
 
     logger.info("Exporting model to Core AI dialect...")
+    if os.environ.get("COREAI_MACOS_DECODE_ENTRYPOINT", "").lower() in ("1", "true", "yes"):
+        decode_reference_inputs, decode_dynamic_shapes = _build_decode_reference_inputs(
+            model, config, target_dtype, max_context_length
+        )
+        coreai_program = export_to_coreai_entrypoints(
+            model,
+            [
+                ("main", reference_inputs, dynamic_shapes),
+                ("decode", decode_reference_inputs, decode_dynamic_shapes),
+            ],
+            input_names=input_names,
+            output_names=output_names,
+            state_names=state_names,
+        )
+    else:
+        coreai_program = export_to_coreai(
+            model,
+            reference_inputs,
+            dynamic_shapes=dynamic_shapes,
+            input_names=input_names,
+            output_names=output_names,
+            state_names=state_names,
+        )
+
+    if _should_optimize():
+        logger.info("Optimizing AIProgram...")
+        coreai_program.optimize()
+    else:
+        logger.info("Skipping AIProgram optimization (COREAI_MACOS_OPTIMIZE=0)")
+
+    return coreai_program
+
+
+def export_macos_model_entrypoint(
+    model: torch.nn.Module,
+    config,
+    export_config,
+    entrypoint_name: Literal["main", "decode"],
+) -> AIProgram:
+    """Export a single macOS entrypoint as its own AIProgram."""
+    max_context_length = getattr(export_config, "max_context_length", None)
+    if max_context_length is None:
+        max_context_length = getattr(config, "max_position_embeddings", 2048)
+
+    target_dtype = next(model.parameters()).dtype
+    logger.info(
+        "Exporting macOS %s entrypoint (dtype=%s, max_context_length=%s)",
+        entrypoint_name,
+        target_dtype,
+        max_context_length,
+    )
+
+    if entrypoint_name == "decode":
+        reference_inputs, dynamic_shapes = _build_decode_reference_inputs(
+            model, config, target_dtype, max_context_length
+        )
+    else:
+        reference_inputs, dynamic_shapes = _build_reference_inputs(
+            model, config, target_dtype, max_context_length
+        )
+
+    logger.info("Exporting %s entrypoint to Core AI dialect...", entrypoint_name)
     coreai_program = export_to_coreai(
         model,
         reference_inputs,
         dynamic_shapes=dynamic_shapes,
-        input_names=input_names,
-        output_names=output_names,
-        state_names=state_names,
+        input_names=("input_ids", "position_ids"),
+        output_names=("logits",),
+        state_names=(KEY_CACHE_NAME, VALUE_CACHE_NAME),
+        entrypoint_name=entrypoint_name,
     )
 
-    logger.info("Optimizing AIProgram...")
-    coreai_program.optimize()
-
+    if _should_optimize():
+        logger.info("Optimizing %s AIProgram...", entrypoint_name)
+        coreai_program.optimize()
+    else:
+        logger.info(
+            "Skipping %s AIProgram optimization (COREAI_MACOS_OPTIMIZE=0)",
+            entrypoint_name,
+        )
     return coreai_program
