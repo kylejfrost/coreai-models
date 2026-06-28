@@ -317,17 +317,24 @@ async def _async_export_model(config: ExportConfig) -> str:
             config.variant == "macOS"
             and os.environ.get("COREAI_MACOS_DECODE_ASSET", "").lower() in ("1", "true", "yes")
         )
+        split_asset_only = os.environ.get("COREAI_MACOS_DECODE_ASSET_ONLY", "").lower()
+        if split_asset_only not in ("", "main", "decode"):
+            raise ValueError(
+                "COREAI_MACOS_DECODE_ASSET_ONLY must be unset, 'main', or 'decode'"
+            )
+        export_main_asset = split_asset_only in ("", "main")
+        export_decode_asset = split_asset_only in ("", "decode")
         decode_asset_name = f"{output_name}-decode.aimodel"
         decode_aimodel_path = bundle_path / decode_asset_name
 
-        if aimodel_path.exists():
+        if aimodel_path.exists() and export_main_asset:
             if config.overwrite:
                 shutil.rmtree(aimodel_path)
             else:
                 raise FileExistsError(
                     f"{aimodel_path} already exists. Use --overwrite to replace it."
                 )
-        if separate_decode_asset and decode_aimodel_path.exists():
+        if separate_decode_asset and decode_aimodel_path.exists() and export_decode_asset:
             if config.overwrite:
                 shutil.rmtree(decode_aimodel_path)
             else:
@@ -339,29 +346,41 @@ async def _async_export_model(config: ExportConfig) -> str:
         if separate_decode_asset:
             metadata = build_aimodel_metadata(config.hf_model_id)
 
-            logger.info(f"Saving main model to {aimodel_path}...")
-            main_program = export_macos_model_entrypoint(model, hf_config, config, "main")
-            await asyncio.to_thread(main_program.save_asset, aimodel_path, metadata)
-            del main_program
+            if export_main_asset:
+                logger.info(f"Saving main model to {aimodel_path}...")
+                main_program = export_macos_model_entrypoint(model, hf_config, config, "main")
+                if split_asset_only == "main":
+                    model = None
+                    gc.collect()
+                await asyncio.to_thread(main_program.save_asset, aimodel_path, metadata)
+                del main_program
+                gc.collect()
+
+            if export_decode_asset:
+                logger.info(f"Saving decode model to {decode_aimodel_path}...")
+                decode_program = export_macos_model_entrypoint(model, hf_config, config, "decode")
+                if split_asset_only == "decode":
+                    model = None
+                    gc.collect()
+                await asyncio.to_thread(decode_program.save_asset, decode_aimodel_path, metadata)
+                del decode_program
+                gc.collect()
+
+            model = None
             gc.collect()
 
-            logger.info(f"Saving decode model to {decode_aimodel_path}...")
-            decode_program = export_macos_model_entrypoint(model, hf_config, config, "decode")
-            await asyncio.to_thread(decode_program.save_asset, decode_aimodel_path, metadata)
-            del decode_program
-            gc.collect()
-            del model
-
-            bundle_llm_asset(
-                bundle_path=bundle_path,
-                hf_model_id=config.hf_model_id,
-                hf_config=hf_config,
-                compression=config.compression,
-                name=output_name,
-                decode_asset_name=decode_asset_name,
-            )
-
-            logger.info(f"Export complete: {bundle_path}")
+            if split_asset_only != "main" and aimodel_path.exists() and decode_aimodel_path.exists():
+                bundle_llm_asset(
+                    bundle_path=bundle_path,
+                    hf_model_id=config.hf_model_id,
+                    hf_config=hf_config,
+                    compression=config.compression,
+                    name=output_name,
+                    decode_asset_name=decode_asset_name,
+                )
+                logger.info(f"Export complete: {bundle_path}")
+            else:
+                logger.info(f"Partial split export complete: {bundle_path}")
             return str(bundle_path)
 
         if config.variant == "macOS":
