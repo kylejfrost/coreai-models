@@ -10,6 +10,17 @@ from functools import lru_cache
 
 import torch.nn as nn
 
+# Gemma-4 is not in transformers yet. Import its module eagerly (here, at
+# registry import time, which the export CLI triggers before
+# `AutoConfig.from_pretrained` is called) so its `AutoConfig` /
+# `AutoTokenizer` registration runs in time.
+from coreai_models.models.macos import gemma4 as _gemma4  # noqa: F401
+
+# Qwen3.5 is likewise not in transformers yet; import eagerly so its AutoConfig
+# registration runs before the export CLI calls `AutoConfig.from_pretrained`.
+from coreai_models.models.macos import qwen3_5 as _qwen3_5  # noqa: F401
+from coreai_models.models.macos import qwen3_5_moe as _qwen3_5_moe  # noqa: F401
+
 
 @dataclass
 class ModelEntry:
@@ -34,11 +45,18 @@ def _get_registry() -> dict[str, ModelEntry]:
     from coreai_models.models.ios.qwen2 import Qwen2ForCausalLMForiOS
     from coreai_models.models.ios.qwen3 import Qwen3ForCausalLMForiOS
     from coreai_models.models.macos.gemma3_text import Gemma3ForCausalLM
+    from coreai_models.models.macos.gemma4 import (
+        Gemma4AssistantForCausalLM,
+        Gemma4ForCausalLM,
+    )
+    from coreai_models.models.macos.glm4 import Glm4ForCausalLM
     from coreai_models.models.macos.gpt_oss import GptOssForCausalLM
     from coreai_models.models.macos.mistral import MistralForCausalLM
     from coreai_models.models.macos.mixtral import MixtralForCausalLM
     from coreai_models.models.macos.qwen2 import Qwen2ForCausalLM
     from coreai_models.models.macos.qwen3 import Qwen3ForCausalLM
+    from coreai_models.models.macos.qwen3_5 import Qwen3_5ForCausalLM
+    from coreai_models.models.macos.qwen3_5_moe import Qwen3_5MoeForCausalLM
     from coreai_models.models.macos.qwen3_moe import Qwen3MoeForCausalLM
 
     return {
@@ -46,6 +64,18 @@ def _get_registry() -> dict[str, ModelEntry]:
             macos_class=Gemma3ForCausalLM,
             hf_config_attr="text_config",
             hf_state_dict_prefix="language_model.",
+        ),
+        "gemma4": ModelEntry(
+            macos_class=Gemma4ForCausalLM,
+            hf_config_attr="text_config",
+            hf_state_dict_prefix="model.language_model.",
+        ),
+        "gemma4_assistant": ModelEntry(
+            macos_class=Gemma4AssistantForCausalLM,
+            hf_config_attr="text_config",
+        ),
+        "glm4": ModelEntry(
+            macos_class=Glm4ForCausalLM,
         ),
         "gpt_oss": ModelEntry(
             macos_class=GptOssForCausalLM,
@@ -67,6 +97,21 @@ def _get_registry() -> dict[str, ModelEntry]:
         ),
         "qwen3_moe": ModelEntry(
             macos_class=Qwen3MoeForCausalLM,
+        ),
+        "qwen3_5": ModelEntry(
+            macos_class=Qwen3_5ForCausalLM,
+            hf_config_attr="text_config",
+            # Empty prefix: text weights live under `model.language_model.` but
+            # the untied `lm_head.weight` is top-level (outside `model.`), so we
+            # take the whole checkpoint and remap/strip in `load_state_dict`.
+            hf_state_dict_prefix="",
+        ),
+        "qwen3_5_moe": ModelEntry(
+            macos_class=Qwen3_5MoeForCausalLM,
+            hf_config_attr="text_config",
+            # Empty prefix keeps the top-level untied `lm_head.weight`; the
+            # loader still buckets `model.language_model.layers.*` per-layer.
+            hf_state_dict_prefix="",
         ),
     }
 

@@ -173,7 +173,7 @@ def _build_safetensors_key_index(
     Returns ``(per_layer_index, shared_index)`` keyed by *original* safetensors
     keys (prefix not stripped); callers must strip before assigning.
     """
-    layer_pattern = re.compile(r"model\.layers\.(\d+)\.")
+    layer_pattern = re.compile(r"(?:model\.language_model\.|model\.)layers\.(\d+)\.")
     per_layer: dict[int, dict[str, str]] = {}
     shared: dict[str, str] = {}
     for path in safetensors_files:
@@ -440,9 +440,14 @@ class BaseForCausalLM(torch.nn.Module):
                 Use for multimodal checkpoints where text weights live under
                 a prefix (e.g. ``"language_model."``).
         """
-        model_dir = snapshot_download(
-            huggingface_model_id,
-            allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
+        import os as _os
+        model_dir = (
+            huggingface_model_id
+            if _os.path.isdir(huggingface_model_id)
+            else snapshot_download(
+                huggingface_model_id,
+                allow_patterns=["*.safetensors", "*.safetensors.index.json", "config.json"],
+            )
         )
 
         raw_config = AutoConfig.from_pretrained(model_dir)
