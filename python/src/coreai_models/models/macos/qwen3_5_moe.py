@@ -139,6 +139,8 @@ _EXPERT_SWITCH_SUFFIXES = (
     "mlp.switch_mlp.down_proj",
 )
 
+_SHARED_LINEAR_SUFFIXES = ("lm_head",)
+
 
 def _resolve_authored_quantization() -> tuple[int, int] | None:
     """Return ``(dense_bits, expert_bits)`` for the opt-in authored quant path."""
@@ -406,6 +408,14 @@ class Qwen3_5MoeForCausalLM(BaseForCausalLM):
         if quant is None:
             return
         dense_bits, expert_bits = quant
+        _maybe_quantize_state_dict(
+            self,
+            state_dict,
+            _SHARED_LINEAR_SUFFIXES,
+            key_prefix="",
+            n_bits=dense_bits,
+            compute_dtype=target_dtype,
+        )
         layer_indices = sorted(
             {
                 int(m.group(1))

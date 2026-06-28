@@ -484,6 +484,7 @@ class BaseForCausalLM(torch.nn.Module):
         shared_dict = _load_tensors_for_keys(shared_index, target_dtype)
         shared_dict = {k.removeprefix(hf_state_dict_prefix): v for k, v in shared_dict.items()}
         del shared_index
+        model._postprocess_loaded_state_dict(shared_dict, target_dtype=target_dtype)
 
         if mmap_path is not None:
             os.makedirs(mmap_path, exist_ok=True)
