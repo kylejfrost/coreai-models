@@ -7,6 +7,7 @@
 
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,9 @@ def _write_metadata(
     compression: str,
     name: str,
 ) -> None:
+    function_map = {"main": ["main"]}
+    if os.environ.get("COREAI_MACOS_DECODE_ENTRYPOINT", "").lower() in ("1", "true", "yes"):
+        function_map["decode"] = ["decode"]
     metadata: dict[str, Any] = {
         "metadata_version": METADATA_VERSION,
         "kind": "llm",
@@ -56,7 +60,7 @@ def _write_metadata(
             "vocab_size": getattr(hf_config, "vocab_size", None),
             "max_context_length": getattr(hf_config, "max_position_embeddings", None),
             "embedded_tokenizer": True,
-            "function_map": {"main": ["main"]},
+            "function_map": function_map,
         },
         "source": {
             "model_definition": "torch",
