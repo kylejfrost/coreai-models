@@ -244,14 +244,14 @@ class Qwen3_5MoeForCausalLM(BaseForCausalLM):
         state_dict.clear()
         state_dict.update(remapped)
 
-        moe_layers = sorted(
+        fused_moe_layers = sorted(
             {
                 int(m.group(1))
                 for key in state_dict
                 if (m := re.match(r"model\.layers\.(\d+)\.mlp\.experts\.gate_up_proj$", key))
             }
         )
-        for layer_idx in moe_layers:
+        for layer_idx in fused_moe_layers:
             prefix = f"model.layers.{layer_idx}.mlp."
             gate_up = state_dict.pop(prefix + "experts.gate_up_proj")
             mid = gate_up.shape[-2] // 2
@@ -264,6 +264,37 @@ class Qwen3_5MoeForCausalLM(BaseForCausalLM):
             state_dict[prefix + "switch_mlp.down_proj.weight"] = (
                 state_dict.pop(prefix + "experts.down_proj").unsqueeze(0).contiguous()
             )
+
+        split_moe_layers = sorted(
+            {
+                int(m.group(1))
+                for key in state_dict
+                if (
+                    m := re.match(
+                        r"model\.layers\.(\d+)\.mlp\.experts\.0\.gate_proj\.weight",
+                        key,
+                    )
+                )
+            }
+        )
+        for layer_idx in split_moe_layers:
+            prefix = f"model.layers.{layer_idx}.mlp."
+            num_experts = 0
+            while f"{prefix}experts.{num_experts}.gate_proj.weight" in state_dict:
+                num_experts += 1
+
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                first_weight = state_dict[f"{prefix}experts.0.{proj}.weight"]
+                packed = torch.empty(
+                    (1, num_experts) + first_weight.shape,
+                    dtype=first_weight.dtype,
+                    device=first_weight.device,
+                )
+                for expert_idx in range(num_experts):
+                    packed[0, expert_idx] = state_dict.pop(
+                        f"{prefix}experts.{expert_idx}.{proj}.weight"
+                    )
+                state_dict[f"{prefix}switch_mlp.{proj}.weight"] = packed.contiguous()
 
     @override
     def _mutate_state_dict(self: Self, state_dict: dict[str, torch.Tensor]) -> None:
