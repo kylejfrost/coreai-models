@@ -300,6 +300,20 @@ class BaseForCausalLM(torch.nn.Module):
         """
         ...
 
+    def _postprocess_loaded_state_dict(
+        self: Self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        target_dtype: torch.dtype,
+    ) -> None:
+        """Optionally mutate a loaded state dict with access to the model instance.
+
+        Most model families can express all remapping in ``_mutate_state_dict``.
+        Some authored compression paths need the instantiated module so they can
+        install parametrizations and remove the corresponding raw weights before
+        the remaining tensors are loaded or memory-mapped.
+        """
+
     @classmethod
     def _get_reauthored_config(
         cls,
@@ -388,6 +402,7 @@ class BaseForCausalLM(torch.nn.Module):
             }
 
         model._mutate_state_dict(state_dict)
+        model._postprocess_loaded_state_dict(state_dict, target_dtype=target_dtype)
 
         # check the state_dict is in the correct dtype
         for k, v in state_dict.items():
@@ -492,6 +507,7 @@ class BaseForCausalLM(torch.nn.Module):
             # Subclass `_mutate_state_dict` is layer-keyed and safe on a
             # single-layer slice.
             model._mutate_state_dict(layer_sd)
+            model._postprocess_loaded_state_dict(layer_sd, target_dtype=target_dtype)
 
             if mmap_path is not None:
                 layer_prefix = f"model.layers.{layer_idx}."
@@ -548,6 +564,7 @@ class BaseForCausalLM(torch.nn.Module):
 
         state_dict = torch.load(model_path, map_location="cpu")
         model._mutate_state_dict(state_dict)
+        model._postprocess_loaded_state_dict(state_dict, target_dtype=target_dtype)
         model.load_state_dict(state_dict, assign=True)
 
         if mmap_path is not None:

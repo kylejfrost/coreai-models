@@ -11,10 +11,14 @@ checkpoints live under ``model.language_model.``; vision and MTP weights are
 dropped for text-only export.
 """
 
+import os
 import re
 
 import torch
 import torch.nn as nn
+from torch.nn.utils import parametrize
+from coreai_torch._compression.custom_layers import WeightDequantizeModule
+from coreai_torch._compression.utils import wrap_for_parametrization
 from transformers import AutoConfig, PretrainedConfig
 from typing_extensions import Self, override
 
@@ -107,6 +111,97 @@ def _register_hf() -> None:
 
 
 _register_hf()
+
+_WeightDequantizedParametrization = wrap_for_parametrization(WeightDequantizeModule)
+
+_AUTHORED_QUANT_ENV = "QWEN35_MOE_QUANTIZE"
+
+_DENSE_LINEAR_SUFFIXES = (
+    "linear_attn.in_proj_qkv",
+    "linear_attn.in_proj_z",
+    "linear_attn.in_proj_a",
+    "linear_attn.in_proj_b",
+    "linear_attn.out_proj",
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+    "mlp.gate",
+    "mlp.shared_expert.gate_proj",
+    "mlp.shared_expert.up_proj",
+    "mlp.shared_expert.down_proj",
+    "mlp.shared_expert_gate",
+)
+
+_EXPERT_SWITCH_SUFFIXES = (
+    "mlp.switch_mlp.gate_proj",
+    "mlp.switch_mlp.up_proj",
+    "mlp.switch_mlp.down_proj",
+)
+
+
+def _resolve_authored_quantization() -> tuple[int, int] | None:
+    """Return ``(dense_bits, expert_bits)`` for the opt-in authored quant path."""
+    mode = os.environ.get(_AUTHORED_QUANT_ENV, "").strip().lower().replace("-", "_")
+    if mode in ("", "0", "false", "off", "none"):
+        return None
+    if mode in ("mixed", "mixed_4bit_experts_int8", "4bit_experts_int8", "int4_experts_int8"):
+        return (4, 8)
+    if mode in ("int4", "4", "i4"):
+        return (4, 4)
+    if mode in ("int8", "8", "i8"):
+        return (8, 8)
+    raise ValueError(
+        f"unsupported {_AUTHORED_QUANT_ENV}={mode!r} "
+        "(use mixed_4bit_experts_int8|int4|int8|none)"
+    )
+
+
+def _get_submodule(root: nn.Module, path: str) -> nn.Module:
+    obj: object = root
+    for part in path.split("."):
+        obj = obj[int(part)] if part.isdigit() else getattr(obj, part)
+    return obj  # type: ignore[return-value]
+
+
+def _install_int_quant(
+    module: nn.Module,
+    weight: torch.Tensor,
+    n_bits: int,
+    compute_dtype: torch.dtype,
+) -> None:
+    """Install an int weight + dequant parametrization with Core AI-safe scale dtype."""
+    qmax = (1 << (n_bits - 1)) - 1
+    scale_dtype = torch.float32 if n_bits <= 4 else compute_dtype
+    wf = weight.detach().to(torch.float32)
+    amax = wf.abs().amax(dim=-1, keepdim=True)
+    scale = (amax / qmax).clamp_min(1e-8).to(scale_dtype)
+    q = torch.round(wf / scale.to(torch.float32)).clamp_(-qmax, qmax).to(torch.int8).contiguous()
+    param = _WeightDequantizedParametrization(q, scale.contiguous(), output_dtype=scale_dtype)
+    parametrize.register_parametrization(module, "weight", param, unsafe=True)
+    module.parametrizations.weight.original = nn.Parameter(torch.zeros(1, dtype=compute_dtype))
+
+
+def _maybe_quantize_state_dict(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+    suffixes: tuple[str, ...],
+    *,
+    key_prefix: str,
+    n_bits: int,
+    compute_dtype: torch.dtype,
+) -> None:
+    for suffix in suffixes:
+        key = f"{key_prefix}{suffix}.weight"
+        weight = state_dict.pop(key, None)
+        if weight is None:
+            continue
+        _install_int_quant(
+            _get_submodule(model, f"{key_prefix}{suffix}"),
+            weight,
+            n_bits,
+            compute_dtype,
+        )
 
 
 class Qwen3_5SparseMoeBlock(nn.Module):
@@ -299,6 +394,43 @@ class Qwen3_5MoeForCausalLM(BaseForCausalLM):
     @override
     def _mutate_state_dict(self: Self, state_dict: dict[str, torch.Tensor]) -> None:
         self._prepare_state_dict(state_dict)
+
+    @override
+    def _postprocess_loaded_state_dict(
+        self: Self,
+        state_dict: dict[str, torch.Tensor],
+        *,
+        target_dtype: torch.dtype,
+    ) -> None:
+        quant = _resolve_authored_quantization()
+        if quant is None:
+            return
+        dense_bits, expert_bits = quant
+        layer_indices = sorted(
+            {
+                int(m.group(1))
+                for key in state_dict
+                if (m := re.match(r"model\.layers\.(\d+)\.", key))
+            }
+        )
+        for layer_idx in layer_indices:
+            prefix = f"model.layers.{layer_idx}."
+            _maybe_quantize_state_dict(
+                self,
+                state_dict,
+                _DENSE_LINEAR_SUFFIXES,
+                key_prefix=prefix,
+                n_bits=dense_bits,
+                compute_dtype=target_dtype,
+            )
+            _maybe_quantize_state_dict(
+                self,
+                state_dict,
+                _EXPERT_SWITCH_SUFFIXES,
+                key_prefix=prefix,
+                n_bits=expert_bits,
+                compute_dtype=target_dtype,
+            )
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         remapped = dict(state_dict)
